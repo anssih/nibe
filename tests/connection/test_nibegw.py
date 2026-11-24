@@ -7,8 +7,13 @@ from unittest.mock import Mock, call
 import pytest
 
 from nibe.coil import CoilData
-from nibe.connection.nibegw import ConnectionStatus, NibeGW
-from nibe.exceptions import NoMappingException, ReadTimeoutException, WriteException
+from nibe.connection.nibegw import ConnectionStatus, NibeGW, xor8
+from nibe.exceptions import (
+    NoMappingException,
+    ReadException,
+    ReadTimeoutException,
+    WriteException,
+)
 from nibe.heatpump import HeatPump, Model, ProductInfo
 
 
@@ -37,6 +42,58 @@ def _enqueue_datagram(nibegw: NibeGW, data: str):
     asyncio.get_event_loop().call_soon(
         nibegw.datagram_received, binascii.unhexlify(data), ("127.0.0.1", 12345)
     )
+
+
+def _modbus_response(command: int, data: bytes) -> bytes:
+    escaped = data.replace(b"\x5c", b"\x5c\x5c")
+    body = bytes((0, 0x20, command, len(escaped))) + escaped
+    return b"\x5c" + body + bytes((xor8(body),))
+
+
+@pytest.mark.parametrize(("low_word", "expected"), [(0x1234, 4.66), (0xFFFF, None)])
+async def test_read_only_the_low_word(
+    nibegw: NibeGW, heatpump: HeatPump, low_word: int, expected: float | None
+):
+    coil = heatpump.get_coil_by_address(43424)
+    coil.size = "u32"
+    coil.factor = 1000
+    coil.f_series_word_collision = True
+    coil.low_word_sufficient = True
+    payload = (
+        coil.address.to_bytes(2, "little")
+        + low_word.to_bytes(2, "little")
+        + b"\xfb\x00"
+    )
+    _enqueue_datagram(nibegw, _modbus_response(0x6A, payload).hex())
+
+    assert await nibegw.read_coil(coil, timeout=0.1) == CoilData(coil, expected)
+
+
+@pytest.mark.parametrize(
+    ("low_word_sufficient", "word_swap", "message"),
+    [
+        (True, False, "word swap"),
+        (True, None, "word swap"),
+        (False, True, "second word"),
+    ],
+)
+async def test_reject_colliding_direct_read(
+    nibegw: NibeGW,
+    heatpump: HeatPump,
+    transport: Mock,
+    low_word_sufficient: bool,
+    word_swap: bool | None,
+    message: str,
+):
+    coil = heatpump.get_coil_by_address(43424)
+    coil.f_series_word_collision = True
+    coil.low_word_sufficient = low_word_sufficient
+    nibegw.coil_encoder.word_swap = word_swap
+
+    with pytest.raises(ReadException, match=message):
+        await nibegw.read_coil(coil)
+
+    transport.sendto.assert_not_called()
 
 
 async def test_read_coil_with_incomplete_broadcast(

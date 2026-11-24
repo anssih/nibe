@@ -266,6 +266,11 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
             logger.warning(f"Failed to detect word swap setting: {e}")
 
     async def read_coil(self, coil: Coil, timeout: float = DEFAULT_TIMEOUT) -> CoilData:
+        try:
+            self.coil_encoder.f_series_uses_low_word(coil)
+        except DecodeException as e:
+            raise ReadException(str(e)) from e
+
         async with self._send_lock:
             assert self._transport, "Transport is closed"
             data = Request.build(
@@ -443,7 +448,10 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
     def _on_raw_coil_value(self, coil_address: int, raw_value: bytes) -> None:
         try:
             coil = self._heatpump.get_coil_by_address(coil_address)
-            coil_data = self.coil_encoder.decode(coil, raw_value)
+            low_word_only = self.coil_encoder.f_series_uses_low_word(coil)
+            coil_data = self.coil_encoder.decode(
+                coil, raw_value, low_word_only=low_word_only
+            )
             self._on_coil_read_success(coil_data)
         except NibeException as e:
             self._on_coil_read_error(coil_address, raw_value, e)

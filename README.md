@@ -201,6 +201,19 @@ heatpump.product_info = await connection.read_product_info()
 await heatpump.initialize()
 ```
 
+### 32-bit registers on F-series pumps
+
+On F-series firmware (including SMO and VVM models), a direct read of a 32-bit
+register (`u32`/`s32`) takes its second 16-bit word from the next register
+address if a separate register exists there.
+
+Registers known to have this collision are rejected on direct reads unless
+their full valid range fits in the low 16-bit word (`low_word_sufficient`).
+Reading those registers via NibeGW or MODBUS 40 requires word swap to be
+enabled in service menu 5.3.11 (register `48852`) and `heatpump.word_swap = True`
+(auto-detected by `NibeGW`). For degree minutes, use the 16-bit register
+`43005` instead of `40940`.
+
 ### LOG.SET
 
 F series pumps with MODBUS40 or NibeGW send the registers listed in a `LOG.SET` file without being asked. MODBUS40 sends the first 20 slots, and 32 bit registers take two. Copy the file to a USB stick and load it from the USB menu of the pump.
@@ -270,6 +283,10 @@ python3 -m nibe.console_scripts.convert_csv
 ### 3. Verify JSON files
 
 Verify that conversion was successful and required lines correctly appeared in the json files. If some modifications are required you need to edit `extensions.json` to fix these. Do not edit source CSV files.
+
+For F-series 32-bit registers in `extensions.json`:
+- `f_series_word_collision`: set to `true` when a separate register exists at `address + 1`, corrupting the second word of direct reads.
+- `low_word_sufficient`: set to `true` on `u32` registers whose full valid raw range fits in 16 bits (`0..65534`), allowing low-word recovery.
 
 ### 4. Submit PR
 

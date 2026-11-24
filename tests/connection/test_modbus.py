@@ -54,6 +54,69 @@ def fixture_connection_f_series(heatpump_f_series: HeatPump):
     yield Modbus(heatpump_f_series, "tcp://127.0.0.1", 0)
 
 
+async def test_f_series_read_low_word(
+    connection_f_series: Modbus, modbus_client: AsyncMock
+):
+    coil = Coil(
+        40001,
+        "test",
+        "test",
+        "u32",
+        1000,
+        f_series_word_collision=True,
+        low_word_sufficient=True,
+    )
+    modbus_client.read_holding_registers.return_value = [1440]
+
+    assert await connection_f_series.read_coil(coil) == CoilData(coil, 1.44)
+    modbus_client.read_holding_registers.assert_awaited_once_with(
+        slave_id=0, starting_address=0, quantity=1
+    )
+
+
+@pytest.mark.parametrize(
+    ("low_word_sufficient", "word_swap", "message"),
+    [
+        (True, False, "word swap"),
+        (False, True, "second word"),
+    ],
+)
+async def test_f_series_reject_colliding_read(
+    connection_f_series: Modbus,
+    modbus_client: AsyncMock,
+    low_word_sufficient: bool,
+    word_swap: bool,
+    message: str,
+):
+    coil = Coil(
+        40001,
+        "test",
+        "test",
+        "u32",
+        f_series_word_collision=True,
+        low_word_sufficient=low_word_sufficient,
+    )
+    connection_f_series.coil_encoder.word_swap = word_swap
+
+    with pytest.raises(ReadException, match=message):
+        await connection_f_series.read_coil(coil)
+
+    modbus_client.read_holding_registers.assert_not_awaited()
+
+
+async def test_s_series_bypasses_f_series_collision(
+    connection: Modbus,
+    modbus_client: AsyncMock,
+):
+    coil = Coil(40001, "test", "test", "u32", f_series_word_collision=True)
+    modbus_client.read_holding_registers.return_value = [0x1234, 1]
+
+    assert await connection.read_coil(coil) == CoilData(coil, 0x11234)
+    modbus_client.read_holding_registers.assert_awaited_once_with(
+        slave_id=0, starting_address=0, quantity=2
+    )
+
+
 async def test_read_reports_value_out_of_range(
     connection: Modbus, modbus_client: AsyncMock
 ):

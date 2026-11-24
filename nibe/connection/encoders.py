@@ -82,13 +82,30 @@ class CoilDataEncoder(Generic[_RawDataT]):
     def decode_raw_value(self, size: str, raw: _RawDataT) -> int:
         pass
 
-    def decode(self, coil: Coil, raw: _RawDataT) -> CoilData:
-        """Decode coil data from bytes.
+    def f_series_uses_low_word(self, coil: Coil) -> bool:
+        """Return True if an F-series direct read should decode only the low 16-bit word."""
+        if not coil.f_series_word_collision:
+            return False
+        if not coil.low_word_sufficient:
+            raise DecodeException(
+                f"Cannot read {coil.name}: second word comes from register {coil.address + 1}"
+            )
+        if not self.word_swap:
+            raise DecodeException(
+                f"Cannot read {coil.name}: word swap must be enabled to read low word"
+            )
+        return True
+
+    def decode(
+        self, coil: Coil, raw: _RawDataT, *, low_word_only: bool = False
+    ) -> CoilData:
+        """Decode coil data from raw representation.
 
         :raises DecodeException: If decoding fails"""
         try:
-            value = self.decode_raw_value(coil.size, raw)
-            if is_hitting_integer_limit(coil.size, value):
+            size = "u16" if low_word_only else coil.size
+            value = self.decode_raw_value(size, raw)
+            if is_hitting_integer_limit(size, value):
                 value = None
 
             return CoilData.from_raw_value(coil, value)

@@ -1056,7 +1056,7 @@
   },
   "40940": {
     "title": "Degree Minutes (32 bit)",
-    "info": "Degree minutes, 32bit value. Full resolution.",
+    "info": "Degree minutes, 32-bit value. Direct reads cannot read both words reliably due to adjacent register 40941; use 16-bit register 43005 instead.",
     "size": "s32",
     "factor": 10,
     "min": -30000.0,
@@ -1065,7 +1065,8 @@
     "name": "degree-minutes-32-bit-40940",
     "write": true,
     "unit": "DM",
-    "nature": "total"
+    "nature": "total",
+    "f_series_word_collision": true
   },
   "40942": {
     "title": "External ERS 1 accessory block status",

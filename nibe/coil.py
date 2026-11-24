@@ -54,6 +54,8 @@ class Coil:
             - min: Coil raw min value (used for validation)
             - max: Coil raw max value (used for validation)
             - nature: Coil class to indicate if this is (total, total_increasing, measurement, measurement_angle)
+            - f_series_word_collision: Second 16-bit word on F-series direct reads comes from register address + 1
+            - low_word_sufficient: Full unsigned 32-bit value range fits in the low 16-bit word
         """
 
         assert isinstance(address, int), "Address must be defined"
@@ -67,6 +69,12 @@ class Coil:
         self.size = size
         self.factor = factor
         self.is_writable = write
+        self.f_series_word_collision = kwargs.pop("f_series_word_collision", False)
+        self.low_word_sufficient = kwargs.pop("low_word_sufficient", False)
+        if self.f_series_word_collision:
+            assert size in ("u32", "s32")
+        if self.low_word_sufficient:
+            assert size == "u32"
 
         if "mappings" in kwargs:
             mappings = kwargs.pop("mappings")

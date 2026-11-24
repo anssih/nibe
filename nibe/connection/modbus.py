@@ -103,6 +103,13 @@ class Modbus(Connection):
         entity_type, entity_number, entity_count = split_modbus_data(coil)
 
         try:
+            low_word_only = (
+                self._heatpump.model is not None
+                and self._heatpump.model.series == Series.F
+                and self.coil_encoder.f_series_uses_low_word(coil)
+            )
+            if low_word_only:
+                entity_count = 1
             async with asyncio.timeout(timeout), self._send_lock:
                 if entity_type == 3:
                     result = await self._client.read_input_registers(
@@ -131,7 +138,9 @@ class Modbus(Connection):
                 else:
                     raise ReadException(f"Unsupported entity type {entity_type}")
 
-            coil_data = self.coil_encoder.decode(coil, result)
+            coil_data = self.coil_encoder.decode(
+                coil, result, low_word_only=low_word_only
+            )
 
             logger.info(coil_data)
             self._heatpump.notify_coil_update(coil_data)
