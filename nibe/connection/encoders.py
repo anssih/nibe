@@ -1,5 +1,4 @@
 from abc import abstractmethod
-from binascii import hexlify
 from typing import Generic, List, Optional, SupportsInt, TypeVar
 
 from construct import (
@@ -95,8 +94,9 @@ class CoilDataEncoder(Generic[_RawDataT]):
             return CoilData.from_raw_value(coil, value)
 
         except (ValueError, AssertionError, ConstructError, ValidationError) as e:
+            raw_text = raw.hex() if isinstance(raw, bytes) else str(raw)
             raise DecodeException(
-                f"Failed to decode {coil.name} coil from raw: {hexlify(raw).decode('utf-8')}, exception: {e}"
+                f"Failed to decode {coil.name} coil from raw: {raw_text}, exception: {e}"
             ) from e
 
 

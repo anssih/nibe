@@ -7,7 +7,12 @@ import pytest
 
 from nibe.coil import Coil, CoilData
 from nibe.connection.modbus import Modbus
-from nibe.exceptions import ReadException, ReadExceptionGroup, WriteException
+from nibe.exceptions import (
+    DecodeException,
+    ReadException,
+    ReadExceptionGroup,
+    WriteException,
+)
 from nibe.heatpump import HeatPump, Model
 
 
@@ -47,6 +52,20 @@ async def fixture_heatpump_f_series():
 @pytest.fixture(name="connection_f_series")
 def fixture_connection_f_series(heatpump_f_series: HeatPump):
     yield Modbus(heatpump_f_series, "tcp://127.0.0.1", 0)
+
+
+async def test_read_reports_value_out_of_range(
+    connection: Modbus, modbus_client: AsyncMock
+):
+    coil = Coil(40001, "test", "test", "u16", min=0, max=100)
+    modbus_client.read_holding_registers.return_value = [101]
+
+    with pytest.raises(ReadException) as error:
+        await connection.read_coil(coil)
+
+    assert isinstance(error.value.__cause__, DecodeException)
+    assert "[101]" in str(error.value)
+    assert "out of range" in str(error.value)
 
 
 @pytest.mark.parametrize(
