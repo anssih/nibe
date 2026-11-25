@@ -6,7 +6,7 @@ from unittest.mock import Mock, call
 
 import pytest
 
-from nibe.coil import CoilData
+from nibe.coil import Coil, CoilData
 from nibe.connection.nibegw import ConnectionStatus, NibeGW, xor8
 from nibe.exceptions import (
     NoMappingException,
@@ -48,6 +48,192 @@ def _modbus_response(command: int, data: bytes) -> bytes:
     escaped = data.replace(b"\x5c", b"\x5c\x5c")
     body = bytes((0, 0x20, command, len(escaped))) + escaped
     return b"\x5c" + body + bytes((xor8(body),))
+
+
+def _receive_logset(nibegw: NibeGW, words: list[tuple[int, int]]) -> None:
+    payload = b"".join(
+        address.to_bytes(2, "little") + word.to_bytes(2, "little")
+        for address, word in words
+    )
+    nibegw.datagram_received(_modbus_response(0x68, payload), ("127.0.0.1", 12345))
+
+
+@pytest.mark.parametrize("word_swap", [False, True, None])
+async def test_logset_word_order(
+    nibegw: NibeGW, heatpump: HeatPump, word_swap: bool | None
+):
+    nibegw.coil_encoder.word_swap = word_swap
+    coil = heatpump.get_coil_by_address(43424)
+    received = Mock()
+    heatpump.subscribe(HeatPump.COIL_UPDATE_EVENT, received)
+
+    _receive_logset(nibegw, [(coil.address, 0x1234), (coil.address + 1, 3)])
+
+    received.assert_called_once_with(CoilData(coil, 201268))
+
+
+@pytest.mark.parametrize("upper_slots", ["present", "missing", "duplicate_low"])
+async def test_phase_current_logset_recovery(
+    nibegw: NibeGW, heatpump: HeatPump, upper_slots: str
+):
+    nibegw.coil_encoder.word_swap = False
+    coils = [heatpump.get_coil_by_address(address) for address in (40079, 40081, 40083)]
+    received = Mock()
+    heatpump.subscribe(HeatPump.COIL_UPDATE_EVENT, received)
+
+    words = []
+    for coil in coils:
+        words.append((coil.address, 123))
+        if upper_slots == "present":
+            words.append((coil.address + 1, 0))
+        else:
+            words.append((0xFFFF, 0))
+        if upper_slots == "duplicate_low":
+            words.append((coil.address, 124))
+            words.append((0xFFFF, 0))
+
+    _receive_logset(nibegw, words)
+
+    if upper_slots == "duplicate_low":
+        received.assert_not_called()
+    else:
+        assert received.call_args_list == [call(CoilData(coil, 12.3)) for coil in coils]
+
+
+@pytest.mark.parametrize("size", ["u16", "u32"])
+async def test_unknown_register_continuation_skipped(
+    heatpump: HeatPump, monkeypatch: pytest.MonkeyPatch, size: str
+):
+    coil = Coil(
+        32477,
+        "energy",
+        "Energy",
+        size,
+        low_word_sufficient=(size == "u32"),
+    )
+    next_coil = Coil(32478, "hw-energy", "HW Energy", "u16")
+    monkeypatch.setitem(heatpump._address_to_coil, str(coil.address), coil)
+    monkeypatch.setitem(heatpump._address_to_coil, str(next_coil.address), next_coil)
+    nibegw = NibeGW(heatpump)
+    received = Mock()
+    heatpump.subscribe(HeatPump.COIL_UPDATE_EVENT, received)
+
+    # 32476 is unknown, so 32477 (and 32478 when 32477 is u32) may be continuations.
+    _receive_logset(nibegw, [(32476, 5), (32477, 123), (32478, 1)])
+    if size == "u32":
+        received.assert_not_called()
+    else:
+        received.assert_called_once_with(CoilData(next_coil, 1))
+
+    received.reset_mock()
+    _receive_logset(nibegw, [(32476, 5), (0xFFFF, 0), (32477, 123)])
+    received.assert_called_once_with(CoilData(coil, 123))
+
+
+@pytest.mark.parametrize("layout", ["separated", "reversed"])
+async def test_logset_requires_consecutive_slots_for_complete_pair(
+    nibegw: NibeGW, heatpump: HeatPump, layout: str
+):
+    coil = heatpump.get_coil_by_address(43424)
+    good_coil = heatpump.get_coil_by_address(40004)
+    received = Mock()
+    heatpump.subscribe(HeatPump.COIL_UPDATE_EVENT, received)
+    words = [(coil.address, 123), (good_coil.address, 150), (coil.address + 1, 1)]
+    if layout == "reversed":
+        words.reverse()
+
+    _receive_logset(nibegw, words)
+
+    received.assert_called_once_with(CoilData(good_coil, 15))
+
+
+@pytest.mark.parametrize(
+    ("collision", "neighbor_words", "mode", "reason"),
+    [
+        (False, [], "permissive", "incomplete"),
+        (False, [0, 251], "permissive", "ambiguous"),
+        (True, [251], "permissive", "ambiguous"),
+        (True, [251], "strict", "ambiguous"),
+        (True, [], "strict", "incomplete"),
+    ],
+)
+async def test_ignore_incomplete_or_ambiguous_broadcast_pairs(
+    nibegw: NibeGW,
+    heatpump: HeatPump,
+    caplog: pytest.LogCaptureFixture,
+    collision: bool,
+    neighbor_words: list[int],
+    mode: str,
+    reason: str,
+):
+    coil = heatpump.get_coil_by_address(43424)
+    coil.f_series_word_collision = collision
+    good_coil = heatpump.get_coil_by_address(40004)
+    received = Mock()
+    heatpump.subscribe(HeatPump.COIL_UPDATE_EVENT, received)
+    nibegw._table_processing_mode = mode
+    words = [(coil.address, 1500)]
+    words.extend((coil.address + 1, word) for word in neighbor_words)
+    words.append((good_coil.address, 123))
+    with caplog.at_level("DEBUG"):
+        _receive_logset(nibegw, words)
+
+    if mode == "permissive":
+        received.assert_called_once_with(CoilData(good_coil, 12.3))
+    else:
+        received.assert_not_called()
+    assert (
+        f"Skipping coil {coil.address} - {reason} 32-bit broadcast" in caplog.messages
+    )
+
+
+@pytest.mark.parametrize(
+    ("words", "expected"),
+    [
+        # Only first register in LOG.SET (post-reboot slot 2 carries neighbor's word)
+        ([(32473, 100), (32474, 200)], [(32473, 0.1)]),
+        # Both adjacent u32 registers in LOG.SET before reboot
+        (
+            [(32473, 100), (32474, 0), (32474, 200), (32475, 0)],
+            [(32473, 0.1), (32474, 0.2)],
+        ),
+        # Both adjacent u32 registers in LOG.SET after reboot
+        (
+            [(32473, 100), (32474, 200), (32474, 200), (32475, 50)],
+            [(32473, 0.1), (32474, 0.2)],
+        ),
+    ],
+)
+async def test_logset_adjacent_colliding_u32_registers(
+    heatpump: HeatPump,
+    monkeypatch: pytest.MonkeyPatch,
+    words: list[tuple[int, int]],
+    expected: list[tuple[int, float]],
+):
+    heatpump.word_swap = False
+    nibegw = NibeGW(heatpump, table_processing_mode="strict")
+    coils = {
+        address: Coil(
+            address,
+            f"energy-{address}",
+            f"Energy {address}",
+            "u32",
+            factor=1000,
+            f_series_word_collision=True,
+            low_word_sufficient=True,
+        )
+        for address in (32473, 32474)
+    }
+    for address, coil in coils.items():
+        monkeypatch.setitem(heatpump._address_to_coil, str(address), coil)
+    received = Mock()
+    heatpump.subscribe(HeatPump.COIL_UPDATE_EVENT, received)
+
+    _receive_logset(nibegw, words)
+
+    assert received.call_args_list == [
+        call(CoilData(coils[address], value)) for address, value in expected
+    ]
 
 
 @pytest.mark.parametrize(("low_word", "expected"), [(0x1234, 4.66), (0xFFFF, None)])
@@ -96,9 +282,7 @@ async def test_reject_colliding_direct_read(
     transport.sendto.assert_not_called()
 
 
-async def test_read_coil_with_incomplete_broadcast(
-    nibegw: NibeGW, heatpump: HeatPump
-):
+async def test_read_coil_with_incomplete_broadcast(nibegw: NibeGW, heatpump: HeatPump):
     coil = heatpump.get_coil_by_address(43416)
     _enqueue_datagram(
         nibegw,

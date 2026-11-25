@@ -229,6 +229,12 @@ To pick the registers in a terminal UI, with a toggle per register:
 nibe-cli log-set-edit F1155 -o LOG.SET
 ```
 
+`LOG.SET` broadcasts always send the low 16-bit word first, regardless of the
+word-swap setting. Rebooting the pump drops the high-word slot of a 32-bit
+register (marking it unused, or replacing it with register `N+1` if one
+exists); `NibeGW` skips incomplete or ambiguous pairs unless the register is
+marked `low_word_sufficient`.
+
 ## Disclaimer
 
 Nibe is registered mark of NIBE Energy Systems.
@@ -285,7 +291,7 @@ python3 -m nibe.console_scripts.convert_csv
 Verify that conversion was successful and required lines correctly appeared in the json files. If some modifications are required you need to edit `extensions.json` to fix these. Do not edit source CSV files.
 
 For F-series 32-bit registers in `extensions.json`:
-- `f_series_word_collision`: set to `true` when a separate register exists at `address + 1`, corrupting the second word of direct reads.
+- `f_series_word_collision`: set to `true` when a separate register exists at `address + 1`, corrupting the second word of direct reads and post-reboot `LOG.SET` slots.
 - `low_word_sufficient`: set to `true` on `u32` registers whose full valid raw range fits in 16 bits (`0..65534`), allowing low-word recovery.
 
 ### 4. Submit PR

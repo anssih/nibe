@@ -1,6 +1,7 @@
 import asyncio
 from asyncio import CancelledError, Future, InvalidStateError
 from binascii import hexlify
+from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass
 import errno
@@ -124,6 +125,8 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
         self._registered_reads = {}
 
         self.coil_encoder = CoilDataEncoderNibeGw(heatpump.word_swap)
+        # LOG.SET broadcasts always send the low 16-bit word first, regardless of 48852.
+        self._logset_encoder = CoilDataEncoderNibeGw(word_swap=True)
 
         self.read_coil = retry(
             retry=retry_if_exception_type(ReadIOException),
@@ -217,12 +220,7 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
         logger.debug(msg.fields.value)
         cmd = msg.fields.value.cmd
         if cmd == "MODBUS_DATA_MSG":
-            data: dict[int, bytes] = {
-                row.coil_address: row.value
-                for row in msg.fields.value.data
-                if row.coil_address != 0xFFFF
-            }
-            self._on_raw_coil_set(data)
+            self._on_raw_coil_set(msg.fields.value.data)
         elif cmd == "MODBUS_READ_RESP":
             row = msg.fields.value.data
             self._on_raw_coil_value(row.coil_address, row.value)
@@ -456,35 +454,106 @@ class NibeGW(asyncio.DatagramProtocol, Connection, EventServer, ConnectionStatus
         except NibeException as e:
             self._on_coil_read_error(coil_address, raw_value, e)
 
-    def _on_raw_coil_set(self, data: dict[int, bytes]) -> None:
-        successful_coil_data = []
-        decode_exception_occurred = False
-        while data:
-            coil_address = min(data.keys())
-            raw_value = data.pop(coil_address)
+    def _pair_logset_slots(
+        self, rows: list[Container]
+    ) -> tuple[list[tuple[Coil, bytes, bytes | None]], bool]:
+        entries: list[tuple[Coil, bytes, bytes | None]] = []
+        had_error = False
+        ambiguous_next: int | None = None
+        index = 0
+        while index < len(rows):
+            row = rows[index]
+            address = row.coil_address
+            index += 1
+            if address == 0xFFFF:
+                ambiguous_next = None
+                continue
             try:
-                coil = self._heatpump.get_coil_by_address(coil_address)
-                if coil.size in ("u32", "s32"):
-                    if coil_address + 1 not in data:
-                        decode_exception_occurred = True
-                        logger.debug(
-                            "Skipping coil %s - incomplete 32-bit broadcast",
-                            coil_address,
-                        )
-                        continue
-                    raw_value = raw_value + data.pop(coil_address + 1)
-                coil_data = self.coil_encoder.decode(coil, raw_value)
-                successful_coil_data.append(coil_data)
+                coil = self._heatpump.get_coil_by_address(address)
+            except CoilNotFoundException as e:
+                self._on_coil_read_error(address, row.value, e)
+                ambiguous_next = address + 1
+                continue
+
+            if address == ambiguous_next:
+                had_error = True
+                logger.debug("Skipping coil %s - ambiguous broadcast word", address)
+                ambiguous_next = address + 1 if coil.size in ("u32", "s32") else None
+                continue
+            ambiguous_next = None
+
+            high_word: bytes | None = None
+            if (
+                coil.size in ("u32", "s32")
+                and index < len(rows)
+                and rows[index].coil_address == address + 1
+            ):
+                high_word = rows[index].value
+                index += 1
+            entries.append((coil, row.value, high_word))
+        return entries, had_error
+
+    def _decode_logset_entry(
+        self,
+        coil: Coil,
+        low_word: bytes,
+        high_word: bytes | None,
+        raw_counts: Counter[int],
+    ) -> CoilData | None:
+        if coil.size not in ("u32", "s32"):
+            return self._logset_encoder.decode(coil, low_word)
+
+        high_word_usable = (
+            high_word is not None
+            and not coil.f_series_word_collision
+            and raw_counts[coil.address + 1] == 1
+        )
+        if high_word_usable:
+            assert high_word is not None
+            return self._logset_encoder.decode(coil, low_word + high_word)
+        if coil.low_word_sufficient:
+            return self._logset_encoder.decode(coil, low_word, low_word_only=True)
+
+        ambiguous = high_word is not None or raw_counts[coil.address + 1] > 0
+        logger.debug(
+            "Skipping coil %s - %s 32-bit broadcast",
+            coil.address,
+            "ambiguous" if ambiguous else "incomplete",
+        )
+        return None
+
+    def _on_raw_coil_set(self, rows: list[Container]) -> None:
+        raw_counts = Counter(
+            row.coil_address for row in rows if row.coil_address != 0xFFFF
+        )
+        entries, decode_exception_occurred = self._pair_logset_slots(rows)
+        primary_counts = Counter(coil.address for coil, _, _ in entries)
+
+        successful_coil_data: list[CoilData] = []
+        for coil, low_word, high_word in entries:
+            if primary_counts[coil.address] > 1:
+                decode_exception_occurred = True
+                logger.debug("Skipping duplicate broadcast address %s", coil.address)
+                continue
+            try:
+                coil_data = self._decode_logset_entry(
+                    coil, low_word, high_word, raw_counts
+                )
+                if coil_data is None:
+                    decode_exception_occurred = True
+                else:
+                    successful_coil_data.append(coil_data)
             except DecodeException as e:
-                self._on_coil_read_error(coil_address, raw_value, e)
+                raw_value = low_word if high_word is None else low_word + high_word
+                self._on_coil_read_error(coil.address, raw_value, e)
                 decode_exception_occurred = True
             except NibeException as e:
-                self._on_coil_read_error(coil_address, raw_value, e)
+                self._on_coil_read_error(coil.address, low_word, e)
 
         if self._table_processing_mode == "permissive" or (
             self._table_processing_mode == "strict" and not decode_exception_occurred
         ):
-            for coil_data in successful_coil_data:
+            for coil_data in sorted(successful_coil_data, key=lambda d: d.coil.address):
                 self._on_coil_read_success(coil_data)
 
     def _on_coil_value(self, coil_address: int, value: Union[float, int, str]) -> None:

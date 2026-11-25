@@ -177,21 +177,24 @@
     "unit": "A",
     "size": "u32",
     "factor": 10,
-    "name": "eb100-be3-current-40079"
+    "name": "eb100-be3-current-40079",
+    "low_word_sufficient": true
   },
   "40081": {
     "title": "EB100-BE2 Current",
     "unit": "A",
     "size": "u32",
     "factor": 10,
-    "name": "eb100-be2-current-40081"
+    "name": "eb100-be2-current-40081",
+    "low_word_sufficient": true
   },
   "40083": {
     "title": "EB100-BE1 Current",
     "unit": "A",
     "size": "u32",
     "factor": 10,
-    "name": "eb100-be1-current-40083"
+    "name": "eb100-be1-current-40083",
+    "low_word_sufficient": true
   },
   "40121": {
     "title": "BT63 Add Supply Temp",
